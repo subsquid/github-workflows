@@ -7,8 +7,9 @@
 #       - v**
 #
 # Each requested platform is built on a runner of that architecture (no QEMU, no
-# cross-compilation), pushed as `<image>:<version>-<arch>`, and the per-arch images
-# are then combined into the multi-arch `<image>:<version>` (and `:latest`) tags.
+# cross-compilation) and pushed untagged, by digest. The per-platform digests are
+# then combined into the multi-arch `<image>:<version>` (and `:latest`) tags, so
+# the published tags are the same as before; only their contents change.
 #
 # Building natively is what makes the published arm64 variant contain an arm64
 # binary: Dockerfiles that pin their stages to `--platform=$BUILDPLATFORM` used to
@@ -62,7 +63,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
-      archs: ${{ steps.matrix.outputs.archs }}
     steps:
       - name: Map each platform to a native runner
         id: matrix
@@ -85,7 +85,6 @@ jobs:
                 ] | unique_by(.arch)
               }')"
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
-          echo "archs=$(jq -r '.include | map(.arch) | join(" ")' <<<"${matrix}")" >> "$GITHUB_OUTPUT"
           echo "Build matrix: ${matrix}"
 
   build:
@@ -99,12 +98,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Get version
-        run: |
-          VERSION="${GITHUB_REF_NAME:1}"
-          echo "Version: $VERSION"
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -114,22 +107,45 @@ jobs:
           username: ${{ secrets.DOCKER_LOGIN }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
-      - name: Docker build and push (${{ matrix.platform }})
+      - name: Docker build and push by digest (${{ matrix.platform }})
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile_path }}
           platforms: ${{ matrix.platform }}
-          push: true
-          tags: ${{ inputs.image_name }}:${{ env.VERSION }}-${{ matrix.arch }}
+          # Untagged push; the publish job tags the merged manifest.
+          outputs: type=image,name=${{ inputs.image_name }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
 
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
     name: Publish multi-arch tags
-    needs: [prepare, build]
+    needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -139,20 +155,20 @@ jobs:
           username: ${{ secrets.DOCKER_LOGIN }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
-      - name: Combine the per-arch images into the version and latest tags
+      - name: Tag the merged manifest as version (and latest)
+        working-directory: /tmp/digests
         env:
           IMAGE: ${{ inputs.image_name }}
-          ARCHS: ${{ needs.prepare.outputs.archs }}
           PUSH_LATEST: ${{ inputs.push_latest }}
         run: |
           VERSION="${GITHUB_REF_NAME:1}"
-          sources=()
-          for arch in ${ARCHS}; do
-            sources+=("${IMAGE}:${VERSION}-${arch}")
-          done
           tags=(-t "${IMAGE}:${VERSION}")
           if [ "${PUSH_LATEST}" = "true" ]; then
             tags+=(-t "${IMAGE}:latest")
           fi
+          sources=()
+          for digest in *; do
+            sources+=("${IMAGE}@sha256:${digest}")
+          done
           docker buildx imagetools create "${tags[@]}" "${sources[@]}"
           docker buildx imagetools inspect "${IMAGE}:${VERSION}"
