@@ -5,6 +5,16 @@
 #   push:
 #     tags:
 #       - v**
+#
+# Each requested platform is built on a runner of that architecture (no QEMU, no
+# cross-compilation), pushed as `<image>:<version>-<arch>`, and the per-arch images
+# are then combined into the multi-arch `<image>:<version>` (and `:latest`) tags.
+#
+# Building natively is what makes the published arm64 variant contain an arm64
+# binary: Dockerfiles that pin their stages to `--platform=$BUILDPLATFORM` used to
+# ship an amd64 binary under the arm64 tag, because the single amd64 runner built
+# every "platform" itself. Only linux/amd64 and linux/arm64 are supported, since
+# those are the architectures GitHub-hosted runners come in.
 
 name: Docker build and push
 
@@ -16,10 +26,10 @@ on:
         required: true
         type: string
       platforms:
-        description: "Target platforms for the build"
+        description: "Target platforms for the build (linux/amd64 and/or linux/arm64)"
         required: false
         type: string
-        default: "linux/amd64,linux/arm/v7,linux/arm64/v8,linux/386"
+        default: "linux/amd64,linux/arm64"
       dockerfile_path:
         description: "Path to the Dockerfile"
         required: false
@@ -47,9 +57,44 @@ env:
   CI: true
 
 jobs:
-  publish:
-    name: Build and publish docker image
+  prepare:
+    name: Resolve platforms
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      archs: ${{ steps.matrix.outputs.archs }}
+    steps:
+      - name: Map each platform to a native runner
+        id: matrix
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          matrix="$(jq -cn --arg platforms "$PLATFORMS" '
+            ($platforms | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $list
+            | if ($list | length) == 0 then error("platforms is empty") else . end
+            | {
+                include: [
+                  $list[]
+                  | if . == "linux/amd64" then
+                      { platform: ., arch: "amd64", runner: "ubuntu-latest" }
+                    elif . == "linux/arm64" or . == "linux/arm64/v8" then
+                      { platform: ., arch: "arm64", runner: "ubuntu-24.04-arm" }
+                    else
+                      error("unsupported platform \(.): only linux/amd64 and linux/arm64 are built")
+                    end
+                ] | unique_by(.arch)
+              }')"
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "archs=$(jq -r '.include | map(.arch) | join(" ")' <<<"${matrix}")" >> "$GITHUB_OUTPUT"
+          echo "Build matrix: ${matrix}"
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -58,7 +103,7 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME:1}"
           echo "Version: $VERSION"
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -69,22 +114,45 @@ jobs:
           username: ${{ secrets.DOCKER_LOGIN }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
-      - name: Generate tags
-        id: tags
-        run: |
-          TAGS="${{ inputs.image_name }}:${VERSION}"
-          if [ "${{ inputs.push_latest }}" = "true" ]; then
-            TAGS="${TAGS},${{ inputs.image_name }}:latest"
-          fi
-          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
-
-      - name: Docker build and push
+      - name: Docker build and push (${{ matrix.platform }})
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile_path }}
-          platforms: ${{ inputs.platforms }}
+          platforms: ${{ matrix.platform }}
           push: true
-          tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ inputs.image_name }}:${{ env.VERSION }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+  publish:
+    name: Publish multi-arch tags
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_LOGIN }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Combine the per-arch images into the version and latest tags
+        env:
+          IMAGE: ${{ inputs.image_name }}
+          ARCHS: ${{ needs.prepare.outputs.archs }}
+          PUSH_LATEST: ${{ inputs.push_latest }}
+        run: |
+          VERSION="${GITHUB_REF_NAME:1}"
+          sources=()
+          for arch in ${ARCHS}; do
+            sources+=("${IMAGE}:${VERSION}-${arch}")
+          done
+          tags=(-t "${IMAGE}:${VERSION}")
+          if [ "${PUSH_LATEST}" = "true" ]; then
+            tags+=(-t "${IMAGE}:latest")
+          fi
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
