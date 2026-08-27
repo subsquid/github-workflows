@@ -15,7 +15,8 @@
 # binary: Dockerfiles that pin their stages to `--platform=$BUILDPLATFORM` used to
 # ship an amd64 binary under the arm64 tag, because the single amd64 runner built
 # every "platform" itself. Only linux/amd64 and linux/arm64 are supported, since
-# those are the architectures GitHub-hosted runners come in.
+# those are the architectures GitHub-hosted runners come in; each has its own
+# build job below, and `platforms` selects which of them run.
 
 name: Docker build and push
 
@@ -58,42 +59,32 @@ env:
   CI: true
 
 jobs:
-  prepare:
-    name: Resolve platforms
+  validate:
+    name: Validate platforms
     runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - name: Map each platform to a native runner
-        id: matrix
+      - name: Reject platforms that cannot be built natively
         env:
           PLATFORMS: ${{ inputs.platforms }}
         run: |
-          matrix="$(jq -cn --arg platforms "$PLATFORMS" '
-            ($platforms | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $list
-            | if ($list | length) == 0 then error("platforms is empty") else . end
-            | {
-                include: [
-                  $list[]
-                  | if . == "linux/amd64" then
-                      { platform: ., arch: "amd64", runner: "ubuntu-latest" }
-                    elif . == "linux/arm64" or . == "linux/arm64/v8" then
-                      { platform: ., arch: "arm64", runner: "ubuntu-24.04-arm" }
-                    else
-                      error("unsupported platform \(.): only linux/amd64 and linux/arm64 are built")
-                    end
-                ] | unique_by(.arch)
-              }')"
-          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
-          echo "Build matrix: ${matrix}"
+          requested=0
+          # shellcheck disable=SC2086 # splitting on commas/whitespace is the point
+          for platform in ${PLATFORMS//,/ }; do
+            case "${platform}" in
+              linux/amd64|linux/arm64|linux/arm64/v8) requested=$((requested + 1)) ;;
+              *) echo "::error::unsupported platform '${platform}': only linux/amd64 and linux/arm64 are built"; exit 1 ;;
+            esac
+          done
+          if [ "${requested}" -eq 0 ]; then
+            echo "::error::no platforms requested"
+            exit 1
+          fi
 
-  build:
-    name: Build ${{ matrix.arch }}
-    needs: prepare
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: true
-      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+  build-amd64:
+    name: Build amd64
+    needs: validate
+    if: contains(inputs.platforms, 'linux/amd64')
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -107,17 +98,17 @@ jobs:
           username: ${{ secrets.DOCKER_LOGIN }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
-      - name: Docker build and push by digest (${{ matrix.platform }})
+      - name: Docker build and push by digest
         id: build
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile_path }}
-          platforms: ${{ matrix.platform }}
+          platforms: linux/amd64
           # Untagged push; the publish job tags the merged manifest.
           outputs: type=image,name=${{ inputs.image_name }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64
 
       - name: Export digest
         env:
@@ -129,14 +120,61 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v4
         with:
-          name: digest-${{ matrix.arch }}
+          name: digest-amd64
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  build-arm64:
+    name: Build arm64
+    needs: validate
+    if: contains(inputs.platforms, 'linux/arm64')
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_LOGIN }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Docker build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile_path }}
+          platforms: linux/arm64
+          # Untagged push; the publish job tags the merged manifest.
+          outputs: type=image,name=${{ inputs.image_name }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,mode=max,scope=arm64
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-arm64
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
 
   publish:
     name: Publish multi-arch tags
-    needs: build
+    needs: [validate, build-amd64, build-arm64]
+    # Run after the requested builds succeeded; a build that was not requested is skipped, not failed.
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest
     steps:
       - name: Download digests
@@ -161,14 +199,19 @@ jobs:
           IMAGE: ${{ inputs.image_name }}
           PUSH_LATEST: ${{ inputs.push_latest }}
         run: |
+          shopt -s nullglob
+          sources=()
+          for digest in *; do
+            sources+=("${IMAGE}@sha256:${digest}")
+          done
+          if [ "${#sources[@]}" -eq 0 ]; then
+            echo "::error::no platform digests were produced"
+            exit 1
+          fi
           VERSION="${GITHUB_REF_NAME:1}"
           tags=(-t "${IMAGE}:${VERSION}")
           if [ "${PUSH_LATEST}" = "true" ]; then
             tags+=(-t "${IMAGE}:latest")
           fi
-          sources=()
-          for digest in *; do
-            sources+=("${IMAGE}@sha256:${digest}")
-          done
           docker buildx imagetools create "${tags[@]}" "${sources[@]}"
           docker buildx imagetools inspect "${IMAGE}:${VERSION}"
